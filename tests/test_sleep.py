@@ -1,11 +1,14 @@
 """Tests for scripts/sleep.py, run against a copy of examples/demo-memory."""
 
+import datetime
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
+import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -15,32 +18,36 @@ DEMO = os.path.join(ROOT, "examples", "demo-memory")
 
 class SleepTooling(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        self.memory = os.path.join(self.tmp, "project", "memory")
+        self.tmp = os.path.realpath(tempfile.mkdtemp())
+        fresh = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        self.claude = os.path.join(self.tmp, "claude")
+        self.codex = os.path.join(self.tmp, "codex")
+        self.project = os.path.join(self.claude, "projects", "project")
+        self.memory = os.path.join(self.project, "memory")
         shutil.copytree(DEMO, self.memory)
         self.state = os.path.join(self.tmp, "state")
         rows = [
             {
                 "type": "user",
-                "timestamp": "2026-03-06T10:00:00Z",
+                "timestamp": fresh,
                 "message": {
                     "content": "Always open markdown in the editor, not in the browser"
                 },
             },
             {
                 "type": "user",
-                "timestamp": "2026-03-06T10:01:00Z",
+                "timestamp": fresh,
                 "message": {"content": "<system-reminder>injected</system-reminder>"},
             },
             {
                 "type": "user",
                 "isSidechain": True,
-                "timestamp": "2026-03-06T10:02:00Z",
+                "timestamp": fresh,
                 "message": {"content": "subagent prompt"},
             },
             {
                 "type": "user",
-                "timestamp": "2026-03-06T10:03:00Z",
+                "timestamp": fresh,
                 "message": {
                     "content": [
                         {"type": "tool_result", "content": "output"},
@@ -54,10 +61,18 @@ class SleepTooling(unittest.TestCase):
             },
         ]
         with open(
-            os.path.join(self.tmp, "project", "session-1.jsonl"), "w", encoding="utf-8"
+            os.path.join(self.project, "session-1.jsonl"), "w", encoding="utf-8"
         ) as f:
             for r in rows:
                 f.write(json.dumps(r) + "\n")
+        os.makedirs(self.codex)
+        with open(os.path.join(self.codex, "history.jsonl"), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"session_id": "abc12345-1", "ts": time.time() - 3600,
+                                "text": "By default deploy to staging first"}) + "\n")
+            f.write(json.dumps({"session_id": "abc12345-1", "ts": time.time() - 90 * 86400,
+                                "text": "an old prompt outside the window"}) + "\n")
+            f.write("not json\n")
+        self.env = dict(os.environ, CLAUDE_CONFIG_DIR=self.claude, CODEX_HOME=self.codex)
         self.run_dir = self.call("start", "--memory", self.memory, "--minutes", "15")[
             "run"
         ]
@@ -70,6 +85,7 @@ class SleepTooling(unittest.TestCase):
             [sys.executable, SCRIPT, "--state", self.state, *args],
             capture_output=True,
             text=True,
+            env=self.env,
         )
         if ok:
             self.assertEqual(res.returncode, 0, res.stderr)
@@ -122,12 +138,25 @@ class SleepTooling(unittest.TestCase):
 
     def test_turns_keep_only_owner_text(self):
         out = self.call("turns", self.run_dir, "--days", "7")
-        self.assertEqual(out["turns"], 2)
+        self.assertEqual(out["claude"]["turns"], 2)
+        self.assertEqual(out["codex"]["turns"], 1)
         with open(out["file"], encoding="utf-8") as f:
             text = f.read()
         self.assertIn("never force push", text)
         self.assertNotIn("system-reminder", text)
         self.assertNotIn("subagent prompt", text)
+        self.assertIn("deploy to staging first", text)
+        self.assertNotIn("old prompt", text)
+
+    def test_turns_source_can_be_limited(self):
+        out = self.call("turns", self.run_dir, "--source", "codex")
+        self.assertEqual((out["claude"]["turns"], out["codex"]["turns"]), (0, 1))
+
+    def test_survey_discovers_memory_and_sources(self):
+        out = self.call("survey")
+        self.assertIn(os.path.realpath(self.memory), [os.path.realpath(m["memory"]) for m in out["memories"]])
+        self.assertTrue(out["sources"]["claude_code"] and out["sources"]["codex"])
+        self.assertEqual(out["sources"]["codex_turns_7d"], 1)
 
     def candidate(self, old, new):
         with open(os.path.join(self.memory, "MEMORY.md"), encoding="utf-8") as f:
@@ -182,6 +211,109 @@ class SleepTooling(unittest.TestCase):
         self.assertNotEqual(res.returncode, 0)
         with open(os.path.join(self.memory, "MEMORY.md"), encoding="utf-8") as f:
             self.assertIn("a1b2c3d", f.read())
+
+    # --- regressions found by an independent review ---
+
+    def test_backup_through_symlink_contains_files(self):
+        link = os.path.join(self.tmp, "linked-memory")
+        os.symlink(self.memory, link)
+        out = self.call("start", "--memory", link, "--minutes", "5")
+        with tarfile.open(os.path.join(out["run"], "memory-before.tgz")) as tf:
+            names = [m.name for m in tf.getmembers() if m.isfile()]
+        self.assertIn("./MEMORY.md", names)
+        self.assertIn("./projects/recipe-bot.md", names)
+
+    def test_check_catches_short_number_and_extended_number(self):
+        with open(os.path.join(self.memory, "MEMORY.md"), "a", encoding="utf-8") as f:
+            f.write("- [garden-log](projects/garden-log.md) — лимит 12 грядок, бюджет 100\n")
+        cand = self.candidate("лимит 12 грядок, бюджет 100", "бюджет 1000")
+        res = self.call("check", self.run_dir, "--candidate", cand, ok=False, parse=False)
+        lost = {x["fact"] for x in json.loads(res.stdout)["lost_facts"]}
+        self.assertTrue({"12", "100"} <= lost, lost)
+
+    def test_check_sees_links_with_anchor_and_spaces(self):
+        with open(os.path.join(self.memory, "a note.md"), "w", encoding="utf-8") as f:
+            f.write("note\n")
+        with open(os.path.join(self.memory, "MEMORY.md"), "a", encoding="utf-8") as f:
+            f.write("- [Статус](projects/tax-helper.md#status) — смотри раздел\n")
+            f.write("- [Заметка](<a note.md>) — заметка\n")
+        m = self.call("survey", "--memory", self.memory)["memories"][0]
+        self.assertEqual((m["links"], m["broken_links"]), (10, []))
+        cand = self.candidate("- [Заметка](<a note.md>) — заметка\n", "")
+        with open(cand, encoding="utf-8") as f:
+            cand_text = f.read()
+        with open(cand, "w", encoding="utf-8") as f:
+            f.write(cand_text.replace("- [Статус](projects/tax-helper.md#status) — смотри раздел\n", ""))
+        res = self.call("check", self.run_dir, "--candidate", cand, ok=False, parse=False)
+        self.assertEqual(
+            json.loads(res.stdout)["links_dropped"],
+            ["a note.md", "projects/tax-helper.md#status"],
+        )
+
+    def test_install_rejects_broken_encoding_even_when_waived(self):
+        cand = os.path.join(self.run_dir, "MEMORY.new.md")
+        with open(os.path.join(self.memory, "MEMORY.md"), "rb") as f:
+            raw = f.read()
+        with open(cand, "wb") as f:
+            f.write(raw.replace("коротко".encode(), b"\xff\xfe"))
+        res = self.call("install", self.run_dir, "--candidate", cand, "--accept-report", ok=False, parse=False)
+        self.assertNotEqual(res.returncode, 0)
+        with open(os.path.join(self.memory, "MEMORY.md"), "rb") as f:
+            self.assertEqual(f.read(), raw)
+
+    def write_rollout(self, name, meta, rows):
+        d = os.path.join(self.codex, "sessions", "2026", "03", "06")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, name), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "session_meta", "payload": meta}) + "\n")
+            for ts, text in rows:
+                f.write(json.dumps({"type": "response_item", "timestamp": ts, "payload": {
+                    "type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": text}]}}) + "\n")
+
+    def test_turns_read_codex_rollouts_without_duplicates_and_subagents(self):
+        fresh = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        self.write_rollout("rollout-a.jsonl", {"id": "sess-a"}, [
+            (fresh, "# AGENTS.md instructions\n\ninjected"),
+            (fresh, "<environment_context>cwd</environment_context>"),
+            (fresh, "By default deploy to staging first"),
+            (fresh, "Never edit generated files by hand"),
+            ("2025-01-01T00:00:00Z", "a prompt from last year"),
+        ])
+        self.write_rollout("rollout-b.jsonl", {"id": "sess-b", "parent_thread_id": "sess-a"}, [
+            (fresh, "prompt written by another agent"),
+        ])
+        out = self.call("turns", self.run_dir, "--source", "codex")
+        with open(out["file"], encoding="utf-8") as f:
+            text = f.read()
+        self.assertEqual(out["codex"]["turns"], 2)
+        self.assertEqual(text.count("deploy to staging first"), 1)
+        self.assertIn("Never edit generated files", text)
+        for bad in ("AGENTS.md instructions", "environment_context", "last year", "another agent"):
+            self.assertNotIn(bad, text)
+
+    def test_turns_only_run_needs_no_memory(self):
+        out = self.call("start", "--turns-only", "--minutes", "5")
+        self.assertIsNone(out["memory"])
+        turns = self.call("turns", out["run"])
+        self.assertEqual((turns["claude"]["turns"], turns["codex"]["turns"]), (2, 1))
+        self.call("finish", out["run"])
+        res = self.call("batches", out["run"], ok=False, parse=False)
+        self.assertNotEqual(res.returncode, 0)
+
+    def test_turns_window_applies_to_each_message_and_long_ones_are_cut(self):
+        fresh = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with open(os.path.join(self.project, "session-2.jsonl"), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "user", "timestamp": "2025-01-01T00:00:00Z",
+                                "message": {"content": "months-old instruction"}}) + "\n")
+            f.write(json.dumps({"type": "user", "timestamp": fresh,
+                                "message": {"content": "Remember: " + "x" * 3000}}) + "\n")
+        out = self.call("turns", self.run_dir, "--source", "claude")
+        with open(out["file"], encoding="utf-8") as f:
+            text = f.read()
+        self.assertNotIn("months-old", text)
+        self.assertIn("Remember: xxx", text)
+        self.assertIn("3010 chars in the original", text)
 
 
 if __name__ == "__main__":

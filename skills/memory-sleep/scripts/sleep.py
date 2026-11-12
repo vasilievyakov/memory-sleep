@@ -8,7 +8,7 @@ Subcommands:
   hygiene RUN                 frontmatter, encoding, orphan files, disk usage (read-only)
   batches RUN --n K           split index entries into K batch files for parallel agents
   pairs   RUN --n 3           pick distant random pairs of memory entries for the REM phase
-  turns   RUN --days 7        extract the owner's own messages from recent transcripts
+  turns   RUN --days 7        extract the owner's own messages (Claude Code transcripts, Codex history)
   check   RUN --candidate F   compare a candidate index with the live one, list lost facts
   install RUN --candidate F   replace the live index with the candidate (after check)
   finish  RUN                 measure the index again, print before/after
@@ -34,16 +34,21 @@ import tempfile
 INDEX = "MEMORY.md"
 MAX_BYTES = 25000  # the index is loaded into every session; beyond this it is cut
 MAX_LINES = 200
-LINK = re.compile(r"\[([^\]]+)\]\(([^)\s]+\.md)\)")
+# a link to a memory file: [title](file.md), [title](file.md#anchor), [title](<file name.md>)
+LINK = re.compile(r"\[([^\]]+)\]\(<?([^)>#]+?\.md)(?:#[^)>]*)?>?\)")
+ANY_LINK = re.compile(r"\]\(<?([^)>]+)>?\)")
 TOKEN = re.compile(
     r"https?://[^\s)\]>,;]+"
-    r"|~?/[\w.\-/]+"
+    r"|[~\w.\-]*(?:/[\w.\-]+)+"
     r"|\b[\w-]+(?:\.[\w-]+)*\.(?:app|io|com|dev|org|net|ru|ai)\b[^\s)\],;]*"
     r"|\b[0-9a-f]{7,40}\b"
     r"|#\d+"
     r"|\b\d[\d.,:/\-]*\d\b"
+    r"|\b\d\b"
 )
-DEFAULT_STATE = os.path.expanduser("~/.claude/memory-sleep")
+DEFAULT_STATE = os.environ.get("MEMORY_SLEEP_HOME") or os.path.expanduser(
+    "~/.agents/memory-sleep"
+)
 
 
 def read(path):
@@ -81,41 +86,72 @@ def measure(memory):
     }
 
 
-def recent_transcripts(project_dir, days):
+def claude_home():
+    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+
+
+def codex_home():
+    return os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+
+
+def parse_ts(value):
+    """Epoch seconds from an ISO timestamp, or None."""
+    try:
+        return dt.datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def claude_transcripts(memory, days, all_projects=False):
+    """Recent Claude Code transcripts: the memory's own project, or every project."""
+    projects = os.path.realpath(os.path.join(claude_home(), "projects"))
+    own = os.path.dirname(os.path.realpath(memory)) if memory else None
+    if own and os.path.dirname(own) == projects and not all_projects:
+        dirs = [own]
+    else:
+        dirs = glob.glob(os.path.join(projects, "*"))
     cutoff = now().timestamp() - days * 86400
     return [
         p
-        for p in glob.glob(os.path.join(project_dir, "*.jsonl"))
+        for d in dirs
+        for p in glob.glob(os.path.join(d, "*.jsonl"))
         if os.path.getmtime(p) >= cutoff
     ]
 
 
+def memory_candidates():
+    """Folders where an agent's file memory is known to live."""
+    found = glob.glob(os.path.join(claude_home(), "projects", "*", "memory"))
+    found += [
+        os.path.expanduser("~/.agents/memory"),
+        os.path.join(codex_home(), "memory"),
+    ]
+    return sorted(m for m in found if os.path.exists(os.path.join(m, INDEX)))
+
+
 def cmd_survey(a):
-    found = (
-        [a.memory]
-        if a.memory
-        else sorted(
-            os.path.dirname(p)
-            for p in glob.glob(
-                os.path.expanduser(f"~/.claude/projects/*/memory/{INDEX}")
-            )
-        )
-    )
     out = []
-    for m in found:
-        m = os.path.abspath(os.path.expanduser(m))
+    for m in [a.memory] if a.memory else memory_candidates():
+        m = os.path.realpath(os.path.expanduser(m))
         if not os.path.exists(os.path.join(m, INDEX)):
             continue
         d = measure(m)
-        d["transcripts_7d"] = len(recent_transcripts(os.path.dirname(m), 7))
+        d["transcripts_7d"] = len(claude_transcripts(m, 7))
         out.append(d)
-    runs = sorted(glob.glob(os.path.join(a.state, "runs", "*", "meta.json")))
+    runs = sorted(
+        glob.glob(os.path.join(a.state, "runs", "*", "meta.json")), key=os.path.getmtime
+    )
     last = json.load(open(runs[-1])) if runs else None
     cfg = os.path.join(a.state, "config.json")
     print(
         json.dumps(
             {
                 "memories": out,
+                "sources": {
+                    "claude_code": os.path.isdir(os.path.join(claude_home(), "projects")),
+                    "codex": os.path.isdir(codex_home()),
+                    "codex_turns_7d": sum(len(v) for v in codex_turns(7, 1500).values()),
+                },
                 "limits": {"bytes": MAX_BYTES, "lines": MAX_LINES},
                 "last_run": last,
                 "config": json.load(open(cfg)) if os.path.exists(cfg) else None,
@@ -128,24 +164,40 @@ def cmd_survey(a):
 
 
 def cmd_start(a):
-    memory = os.path.abspath(os.path.expanduser(a.memory))
-    if not os.path.exists(os.path.join(memory, INDEX)):
-        sys.exit(f"no {INDEX} in {memory}")
+    memory = None
+    if not a.turns_only:
+        if not a.memory:
+            sys.exit("--memory is required (or pass --turns-only to run without a memory folder)")
+        # realpath: a memory folder reached through a symlink must be archived as files
+        memory = os.path.realpath(os.path.expanduser(a.memory))
+        if not os.path.exists(os.path.join(memory, INDEX)):
+            sys.exit(f"no {INDEX} in {memory}")
     base = os.path.join(a.state, "runs", now().strftime("%Y-%m-%d"))
     run, n = base, 2
     while os.path.exists(run):
         run, n = f"{base}-{n}", n + 1
-    os.makedirs(run)
-    with tarfile.open(os.path.join(run, "memory-before.tgz"), "w:gz") as tf:
-        tf.add(memory, arcname=".")
-    shutil.copy2(os.path.join(memory, INDEX), os.path.join(run, "MEMORY.before.md"))
-    m = measure(memory)
-    json.dump(
-        m,
-        open(os.path.join(run, "metrics-before.json"), "w"),
-        ensure_ascii=False,
-        indent=1,
-    )
+    try:
+        os.makedirs(run)
+    except OSError as e:
+        sys.exit(f"cannot write to {a.state}: {e}. Pass --state <writable folder>.")
+    m = None
+    if memory:
+        archive = os.path.join(run, "memory-before.tgz")
+        with tarfile.open(archive, "w:gz", dereference=True) as tf:
+            tf.add(memory, arcname=".")
+        with tarfile.open(archive) as tf:
+            archived = sum(1 for x in tf.getmembers() if x.isfile())
+        on_disk = sum(len(files) for _, _, files in os.walk(memory, followlinks=True))
+        if archived < on_disk:
+            sys.exit(f"backup is incomplete: {archived} files archived, {on_disk} on disk")
+        shutil.copy2(os.path.join(memory, INDEX), os.path.join(run, "MEMORY.before.md"))
+        m = measure(memory)
+        json.dump(
+            m,
+            open(os.path.join(run, "metrics-before.json"), "w"),
+            ensure_ascii=False,
+            indent=1,
+        )
     start = now()
     deadline = start + dt.timedelta(minutes=a.minutes)
     meta = {
@@ -155,15 +207,17 @@ def cmd_start(a):
         "deadline": deadline.isoformat(timespec="seconds"),
         "run": run,
     }
-    json.dump(
-        meta, open(os.path.join(run, "meta.json"), "w"), ensure_ascii=False, indent=1
-    )
+    json.dump(meta, open(os.path.join(run, "meta.json"), "w"), ensure_ascii=False, indent=1)
     with open(os.path.join(run, "phases.log"), "w", encoding="utf-8") as f:
-        f.write(
-            f"{start:%H:%M} N1: backup memory-before.tgz, index {m['index_bytes']} bytes, "
-            f"{m['index_lines']} lines, {m['links']} links, {len(m['broken_links'])} broken, "
-            f"{m['lines_over_220']} long lines; deadline {deadline:%H:%M}\n"
-        )
+        if m:
+            f.write(
+                f"{start:%H:%M} N1: backup memory-before.tgz ({archived} files), "
+                f"index {m['index_bytes']} bytes, {m['index_lines']} lines, {m['links']} links, "
+                f"{len(m['broken_links'])} broken, {m['lines_over_220']} long lines; "
+                f"deadline {deadline:%H:%M}\n"
+            )
+        else:
+            f.write(f"{start:%H:%M} N1: no memory folder, turns only; deadline {deadline:%H:%M}\n")
     keep_awake = None
     if platform.system() == "Darwin":
         keep_awake = f"caffeinate -i -t {a.minutes * 60 + 120}"
@@ -178,12 +232,15 @@ def cmd_start(a):
     )
 
 
-def load_meta(run):
-    return json.load(open(os.path.join(run, "meta.json")))
+def load_meta(run, need_memory=True):
+    meta = json.load(open(os.path.join(run, "meta.json")))
+    if need_memory and not meta.get("memory"):
+        sys.exit("this run was started with --turns-only: there is no memory folder to work on")
+    return meta
 
 
 def cmd_log(a):
-    meta = load_meta(a.run)
+    meta = load_meta(a.run, need_memory=False)
     t = now()
     with open(os.path.join(a.run, "phases.log"), "a", encoding="utf-8") as f:
         f.write(f"{t:%H:%M} {a.text}\n")
@@ -236,21 +293,24 @@ def cmd_hygiene(a):
             if os.path.normpath(rel) not in linked:
                 rep["not_in_index"].append(rel)
     usage = []
-    root = os.path.expanduser("~/.claude")
-    try:
-        res = subprocess.run(
-            ["du", "-sk"] + sorted(glob.glob(os.path.join(root, "*"))),
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        rows = [l.split("\t") for l in res.stdout.strip().split("\n") if "\t" in l]
-        rows.sort(key=lambda r: -int(r[0]))
-        usage = [
-            f"{int(k) // 1024} MB  {os.path.relpath(p, root)}" for k, p in rows[:8]
-        ]
-    except Exception as e:  # measurement only; a failure here must not stop the run
-        usage = [f"du failed: {e}"]
+    for root in (claude_home(), codex_home()):
+        if not os.path.isdir(root):
+            continue
+        try:
+            res = subprocess.run(
+                ["du", "-sk"] + sorted(glob.glob(os.path.join(root, "*"))),
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            rows = [l.split("\t") for l in res.stdout.strip().split("\n") if "\t" in l]
+            rows.sort(key=lambda r: -int(r[0]))
+            usage += [
+                f"{int(k) // 1024} MB  {os.path.basename(root)}/{os.path.relpath(q, root)}"
+                for k, q in rows[:5]
+            ]
+        except Exception as e:  # measurement only; a failure here must not stop the run
+            usage.append(f"du failed for {os.path.basename(root)}: {e}")
     rep["disk_usage_top"] = usage
     json.dump(
         rep,
@@ -361,67 +421,153 @@ SKIP_PREFIX = (
     "Caveat:",
     "[Image",
     "[Request interrupted",
+    "# AGENTS.md instructions",
 )
 
 
+def keep_turn(t, max_chars):
+    """Text of an owner's message to keep (long ones are cut, not dropped), or None."""
+    t = (t or "").strip()
+    if not t or t.startswith(SKIP_PREFIX):
+        return None
+    if len(t) > max_chars:
+        return t[:max_chars] + f" [cut, {len(t)} chars in the original]"
+    return t
+
+
+def claude_turns(path, max_chars, cutoff):
+    """The owner's own messages from one Claude Code transcript, inside the time window."""
+    got = []
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if '"type":"user"' not in line and '"type": "user"' not in line:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(d, dict) or d.get("type") != "user":
+                continue
+            if d.get("isSidechain") or d.get("isMeta"):
+                continue
+            ts = parse_ts(d.get("timestamp"))
+            if ts is not None and ts < cutoff:
+                continue
+            c = (d.get("message") or {}).get("content")
+            texts = (
+                [c]
+                if isinstance(c, str)
+                else [
+                    b.get("text", "")
+                    for b in (c or [])
+                    if isinstance(b, dict) and b.get("type") == "text"
+                ]
+            )
+            for t in texts:
+                t = keep_turn(t, max_chars)
+                if t:
+                    got.append((str(d.get("timestamp", ""))[:10], t))
+    return got
+
+
+def codex_turns(days, max_chars):
+    """The owner's own messages from Codex CLI: prompt history plus session rollouts, deduplicated."""
+    cutoff = now().timestamp() - days * 86400
+    sessions, seen = {}, set()
+
+    def add(sid, ts, text):
+        t = keep_turn(text, max_chars)
+        if not t or t in seen:
+            return
+        seen.add(t)
+        date = dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+        sessions.setdefault(str(sid), []).append((date, t))
+
+    path = os.path.join(codex_home(), "history.jsonl")
+    if os.path.exists(path):
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(d, dict):
+                    continue
+                ts = d.get("ts")
+                if isinstance(ts, (int, float)) and ts >= cutoff:
+                    add(d.get("session_id", ""), ts, str(d.get("text") or ""))
+
+    pattern = os.path.join(codex_home(), "sessions", "**", "*.jsonl")
+    for p in sorted(glob.glob(pattern, recursive=True)):
+        if os.path.getmtime(p) < cutoff:
+            continue
+        sid, rows, subagent = os.path.basename(p)[-41:-6], [], False
+        with open(p, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(d, dict):
+                    continue
+                pl = d.get("payload") if isinstance(d.get("payload"), dict) else {}
+                if d.get("type") == "session_meta":
+                    sid = str(pl.get("id") or sid)
+                    # sessions spawned by another agent carry that agent's prompt, not the owner's
+                    if pl.get("parent_thread_id") or pl.get("forked_from_id") or pl.get("agent_role"):
+                        subagent = True
+                        break
+                if d.get("type") != "response_item" or pl.get("type") != "message":
+                    continue
+                if pl.get("role") != "user":
+                    continue
+                ts = parse_ts(d.get("timestamp"))
+                if ts is None or ts < cutoff:
+                    continue
+                for b in pl.get("content") or []:
+                    if isinstance(b, dict) and b.get("type") == "input_text":
+                        rows.append((ts, b.get("text", "")))
+        if not subagent:
+            for ts, text in rows:
+                add(sid, ts, text)
+    return sessions
+
+
 def cmd_turns(a):
-    memory = load_meta(a.run)["memory"]
-    proj = os.path.dirname(memory)
-    dirs = (
-        glob.glob(os.path.join(os.path.dirname(proj), "*"))
-        if a.all_projects
-        else [proj]
-    )
-    files = [p for d in dirs for p in recent_transcripts(d, a.days)]
+    memory = load_meta(a.run, need_memory=False)["memory"]
+    cutoff = now().timestamp() - a.days * 86400
     out_path = os.path.join(a.run, "user-turns.md")
-    sessions = turns = 0
+    stats = {"claude": {"transcripts": 0, "sessions": 0, "turns": 0},
+             "codex": {"sessions": 0, "turns": 0}}
     with open(out_path, "w", encoding="utf-8") as out:
-        for p in sorted(files, key=os.path.getmtime):
-            got = []
-            with open(p, encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    if '"type":"user"' not in line and '"type": "user"' not in line:
-                        continue
-                    try:
-                        d = json.loads(line)
-                    except ValueError:
-                        continue
-                    if (
-                        d.get("type") != "user"
-                        or d.get("isSidechain")
-                        or d.get("isMeta")
-                    ):
-                        continue
-                    c = (d.get("message") or {}).get("content")
-                    texts = (
-                        [c]
-                        if isinstance(c, str)
-                        else [
-                            b.get("text", "")
-                            for b in (c or [])
-                            if isinstance(b, dict) and b.get("type") == "text"
-                        ]
-                    )
-                    for t in texts:
-                        t = t.strip()
-                        if not t or len(t) > a.max_chars or t.startswith(SKIP_PREFIX):
-                            continue
-                        got.append((d.get("timestamp", "")[:10], t))
-            if got:
-                sessions += 1
-                turns += len(got)
+        if a.source in ("auto", "claude"):
+            files = claude_transcripts(memory, a.days, a.all_projects)
+            stats["claude"]["transcripts"] = len(files)
+            for p in sorted(files, key=os.path.getmtime):
+                got = claude_turns(p, a.max_chars, cutoff)
+                if not got:
+                    continue
+                stats["claude"]["sessions"] += 1
+                stats["claude"]["turns"] += len(got)
                 out.write(
-                    f"\n## session {os.path.basename(p)[:8]} ({os.path.basename(os.path.dirname(p))})\n"
+                    f"\n## claude session {os.path.basename(p)[:8]} "
+                    f"({os.path.basename(os.path.dirname(p))})\n"
                 )
+                for date, t in got:
+                    out.write(f"- [{date}] {t}\n")
+        if a.source in ("auto", "codex"):
+            for sid, got in codex_turns(a.days, a.max_chars).items():
+                stats["codex"]["sessions"] += 1
+                stats["codex"]["turns"] += len(got)
+                out.write(f"\n## codex session {sid[:8]}\n")
                 for date, t in got:
                     out.write(f"- [{date}] {t}\n")
     print(
         json.dumps(
             {
                 "file": out_path,
-                "transcripts": len(files),
-                "sessions_with_turns": sessions,
-                "turns": turns,
+                **stats,
+                "turns": stats["claude"]["turns"] + stats["codex"]["turns"],
                 "bytes": os.path.getsize(out_path),
             },
             ensure_ascii=False,
@@ -431,8 +577,13 @@ def cmd_turns(a):
 
 def structure(text):
     heads = [l.strip() for l in text.split("\n") if l.startswith("#")]
-    targets = sorted({t for _, t in LINK.findall(text)})
+    targets = sorted({x.strip() for x in ANY_LINK.findall(text)})  # every link, any syntax
     return heads, targets
+
+
+def has_token(tok, text):
+    """True if tok stands in text as a whole identifier, not as a part of a longer one."""
+    return re.search(rf"(?<![\w]){re.escape(tok)}(?![\w])", text) is not None
 
 
 def lost_facts(memory, old, new):
@@ -440,8 +591,7 @@ def lost_facts(memory, old, new):
     new_by_target = {}
     for line in new.split("\n"):
         for _, t in LINK.findall(line):
-            new_by_target.setdefault(t, "")
-            new_by_target[t] += line + "\n"
+            new_by_target[t] = new_by_target.get(t, "") + line + "\n"
     lost = []
     cache = {}
     for line in old.split("\n"):
@@ -449,17 +599,15 @@ def lost_facts(memory, old, new):
             continue
         m = LINK.search(line)
         target = m.group(2) if m else None
-        body = LINK.sub(lambda mm: mm.group(1), line)
+        body = ANY_LINK.sub("]", line)
         scope = new_by_target.get(target, "") if target else new
         if target and target not in cache:
             p = os.path.join(memory, target)
             cache[target] = read(p) if os.path.exists(p) else ""
-        for tok in {t.rstrip(".,;:)") for t in TOKEN.findall(body)}:
-            if len(tok) < 3 or tok in scope:
+        for tok in sorted({t.rstrip(".,;:)") for t in TOKEN.findall(body)}):
+            if not tok or has_token(tok, scope):
                 continue
-            if target and tok in cache[target]:
-                continue
-            if not target and tok in new:
+            if target and has_token(tok, cache[target]):
                 continue
             lost.append({"fact": tok, "target": target, "old_line": line[:200]})
     return lost
@@ -469,10 +617,15 @@ def do_check(run, candidate, max_bytes, max_line):
     memory = load_meta(run)["memory"]
     old = read(os.path.join(memory, INDEX))
     raw = open(candidate, "rb").read()
-    new = raw.decode("utf-8", errors="replace")
+    try:
+        new, utf8_ok = raw.decode("utf-8"), True
+    except UnicodeDecodeError:
+        new, utf8_ok = raw.decode("utf-8", errors="replace"), False
     oh, ot = structure(old)
     nh, nt = structure(new)
+    local = sorted({t for _, t in LINK.findall(new)})
     rep = {
+        "utf8_ok": utf8_ok,
         "bytes": len(raw),
         "bytes_ok": len(raw) <= max_bytes,
         "lines": len(new.split("\n")),
@@ -480,12 +633,13 @@ def do_check(run, candidate, max_bytes, max_line):
         "sections_same": oh == nh,
         "links_dropped": sorted(set(ot) - set(nt)),
         "links_added": sorted(set(nt) - set(ot)),
-        "links_broken": [t for t in nt if not os.path.exists(os.path.join(memory, t))],
+        "links_broken": [t for t in local if not os.path.exists(os.path.join(memory, t))],
         "long_lines": [l[:80] for l in new.split("\n") if len(l) > max_line],
         "lost_facts": lost_facts(memory, old, new),
     }
     rep["ok"] = (
-        rep["bytes_ok"]
+        rep["utf8_ok"]
+        and rep["bytes_ok"]
         and rep["lines_ok"]
         and rep["sections_same"]
         and not rep["links_dropped"]
@@ -506,10 +660,18 @@ def cmd_check(a):
 
 def cmd_install(a):
     memory, rep = do_check(a.run, a.candidate, a.max_bytes, a.max_line)
-    if not rep["ok"] and not a.accept_report:
+    hard = [
+        k
+        for k in ("utf8_ok", "bytes_ok", "lines_ok", "sections_same")
+        if not rep[k]
+    ] + [k for k in ("links_dropped", "links_broken") if rep[k]]
+    if hard or (rep["lost_facts"] and not a.accept_report):
         print(json.dumps(rep, ensure_ascii=False, indent=1))
         sys.exit(
-            "check failed: fix the candidate, or pass --accept-report after each item is resolved by hand"
+            "check failed"
+            + (f" ({', '.join(hard)})" if hard else "")
+            + ": fix the candidate. --accept-report only waives lost_facts, "
+            "after each of them is resolved by hand."
         )
     live = os.path.join(memory, INDEX)
     n = 1
@@ -526,7 +688,11 @@ def cmd_install(a):
 
 
 def cmd_finish(a):
-    meta = load_meta(a.run)
+    meta = load_meta(a.run, need_memory=False)
+    minutes = int((now() - dt.datetime.fromisoformat(meta["started"])).total_seconds() // 60)
+    if not meta.get("memory"):
+        print(json.dumps({"minutes": minutes, "run": a.run, "memory": None}, indent=1))
+        return
     before = json.load(open(os.path.join(a.run, "metrics-before.json")))
     after = measure(meta["memory"])
     json.dump(
@@ -567,7 +733,8 @@ def main():
     x.add_argument("--memory")
     x.set_defaults(f=cmd_survey)
     x = s.add_parser("start")
-    x.add_argument("--memory", required=True)
+    x.add_argument("--memory")
+    x.add_argument("--turns-only", action="store_true")
     x.add_argument("--minutes", type=int, default=30)
     x.set_defaults(f=cmd_start)
     x = s.add_parser("log")
@@ -593,6 +760,7 @@ def main():
     x.add_argument("run")
     x.add_argument("--days", type=int, default=7)
     x.add_argument("--all-projects", action="store_true")
+    x.add_argument("--source", choices=["auto", "claude", "codex"], default="auto")
     x.add_argument("--max-chars", type=int, default=1500)
     x.set_defaults(f=cmd_turns)
     for name, fn in (("check", cmd_check), ("install", cmd_install)):

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Memory Sleep"
+  short_description: "Consolidate file memory in sleep phases"
+  default_prompt: "Use $memory-sleep to run a memory sleep: check memory against disk, pull unsaved rules from recent sessions, shrink the index without losing facts, and report before/after measurements."

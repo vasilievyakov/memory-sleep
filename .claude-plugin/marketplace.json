@@ -1,0 +1,21 @@
+{
+  "name": "memory-sleep",
+  "owner": {
+    "name": "vasilievyakov"
+  },
+  "metadata": {
+    "description": "Сон памяти для Claude Code: консолидация файловой памяти по фазам сна",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "memory-sleep",
+      "description": "Прогон консолидации файловой памяти по фазам сна: сверка с диском, отбор по расшифровкам, перенос уроков, сжатие индекса без потери фактов, отчет с замерами",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./skills/memory-sleep"
+      ]
+    }
+  ]
+}

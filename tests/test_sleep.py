@@ -273,7 +273,7 @@ class SleepTooling(unittest.TestCase):
 
     def test_turns_read_codex_rollouts_without_duplicates_and_subagents(self):
         fresh = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        self.write_rollout("rollout-a.jsonl", {"id": "sess-a"}, [
+        self.write_rollout("rollout-a.jsonl", {"id": "abc12345-1"}, [
             (fresh, "# AGENTS.md instructions\n\ninjected"),
             (fresh, "<environment_context>cwd</environment_context>"),
             (fresh, "By default deploy to staging first"),
@@ -314,6 +314,28 @@ class SleepTooling(unittest.TestCase):
         self.assertNotIn("months-old", text)
         self.assertIn("Remember: xxx", text)
         self.assertIn("3010 chars in the original", text)
+
+    def test_turns_drop_templates_and_in_session_duplicates(self):
+        fresh = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        template = "You receive the first message of a session. " + "Write a title. " * 20
+        for n in range(3):
+            with open(os.path.join(self.project, f"auto-{n}.jsonl"), "w", encoding="utf-8") as f:
+                for text in (template, "check it", "check it"):
+                    f.write(json.dumps({"type": "user", "timestamp": fresh,
+                                        "message": {"content": text}}) + "\n")
+        out = self.call("turns", self.run_dir, "--source", "claude")
+        with open(out["file"], encoding="utf-8") as f:
+            text = f.read()
+        self.assertNotIn("You receive the first message", text)
+        self.assertEqual(text.count("check it"), 3)  # once per session: a repeated correction is kept
+        self.assertEqual(out["dropped"], {"templates": 3, "duplicates": 3})
+
+    def test_check_ignores_slash_between_plain_words(self):
+        with open(os.path.join(self.memory, "MEMORY.md"), "a", encoding="utf-8") as f:
+            f.write("- [garden-log](projects/garden-log.md) — текст лендингов/дашбордов без брифа\n")
+        cand = self.candidate("текст лендингов/дашбордов без брифа", "тексты лендингов и дашбордов без брифа")
+        rep = self.call("check", self.run_dir, "--candidate", cand)
+        self.assertEqual(rep["lost_facts"], [])
 
 
 if __name__ == "__main__":

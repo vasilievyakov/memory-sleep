@@ -34,12 +34,13 @@ import tempfile
 INDEX = "MEMORY.md"
 MAX_BYTES = 25000  # the index is loaded into every session; beyond this it is cut
 MAX_LINES = 200
+SHRINK_BYTES = 24000  # past this the index should be shrunk before it reaches the cut
 # a link to a memory file: [title](file.md), [title](file.md#anchor), [title](<file name.md>)
 LINK = re.compile(r"\[([^\]]+)\]\(<?([^)>#]+?\.md)(?:#[^)>]*)?>?\)")
 ANY_LINK = re.compile(r"\]\(<?([^)>]+)>?\)")
 TOKEN = re.compile(
     r"https?://[^\s)\]>,;]+"
-    r"|[~\w.\-]*(?:/[\w.\-]+)+"
+    r"|[~A-Za-z0-9_.\-]*(?:/[A-Za-z0-9_.\-]+)+"
     r"|\b[\w-]+(?:\.[\w-]+)*\.(?:app|io|com|dev|org|net|ru|ai)\b[^\s)\],;]*"
     r"|\b[0-9a-f]{7,40}\b"
     r"|#\d+"
@@ -83,6 +84,7 @@ def measure(memory):
         "lines_over_220": sum(1 for l in lines if len(l) > 220),
         "memory_files": len(files),
         "over_limit": len(raw) > MAX_BYTES or len(lines) > MAX_LINES,
+        "needs_shrink": len(raw) > SHRINK_BYTES or len(lines) > MAX_LINES,
     }
 
 
@@ -152,7 +154,7 @@ def cmd_survey(a):
                     "codex": os.path.isdir(codex_home()),
                     "codex_turns_7d": sum(len(v) for v in codex_turns(7, 1500).values()),
                 },
-                "limits": {"bytes": MAX_BYTES, "lines": MAX_LINES},
+                "limits": {"bytes": MAX_BYTES, "lines": MAX_LINES, "shrink_at_bytes": SHRINK_BYTES},
                 "last_run": last,
                 "config": json.load(open(cfg)) if os.path.exists(cfg) else None,
                 "state_dir": a.state,
@@ -477,9 +479,11 @@ def codex_turns(days, max_chars):
 
     def add(sid, ts, text):
         t = keep_turn(text, max_chars)
-        if not t or t in seen:
+        # history and rollouts record the same prompt: keep one copy per session,
+        # but let a prompt repeated in another session through (a repeat is a signal)
+        if not t or (str(sid), t) in seen:
             return
-        seen.add(t)
+        seen.add((str(sid), t))
         date = dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
         sessions.setdefault(str(sid), []).append((date, t))
 
@@ -537,31 +541,51 @@ def cmd_turns(a):
     memory = load_meta(a.run, need_memory=False)["memory"]
     cutoff = now().timestamp() - a.days * 86400
     out_path = os.path.join(a.run, "user-turns.md")
-    stats = {"claude": {"transcripts": 0, "sessions": 0, "turns": 0},
-             "codex": {"sessions": 0, "turns": 0}}
+    sessions = []  # (source, label, [(date, text)])
+    n_files = 0
+    if a.source in ("auto", "claude"):
+        files = claude_transcripts(memory, a.days, a.all_projects)
+        n_files = len(files)
+        for p in sorted(files, key=os.path.getmtime):
+            got = claude_turns(p, a.max_chars, cutoff)
+            if got:
+                label = f"{os.path.basename(p)[:8]} ({os.path.basename(os.path.dirname(p))})"
+                sessions.append(("claude", label, got))
+    if a.source in ("auto", "codex"):
+        for sid, got in codex_turns(a.days, a.max_chars).items():
+            sessions.append(("codex", sid[:8], got))
+
+    # A long text that shows up in three or more sessions is a template some tool sends,
+    # not something the owner typed. Short repeats stay: a repeated correction is a signal.
+    seen_in = {}
+    for i, (_, _, got) in enumerate(sessions):
+        for _, t in got:
+            seen_in.setdefault(t, set()).add(i)
+    templates = {t for t, s in seen_in.items() if len(s) >= 3 and len(t) > 200}
+
+    stats = {
+        "claude": {"transcripts": n_files, "sessions": 0, "turns": 0},
+        "codex": {"sessions": 0, "turns": 0},
+        "dropped": {"templates": 0, "duplicates": 0},
+    }
     with open(out_path, "w", encoding="utf-8") as out:
-        if a.source in ("auto", "claude"):
-            files = claude_transcripts(memory, a.days, a.all_projects)
-            stats["claude"]["transcripts"] = len(files)
-            for p in sorted(files, key=os.path.getmtime):
-                got = claude_turns(p, a.max_chars, cutoff)
-                if not got:
-                    continue
-                stats["claude"]["sessions"] += 1
-                stats["claude"]["turns"] += len(got)
-                out.write(
-                    f"\n## claude session {os.path.basename(p)[:8]} "
-                    f"({os.path.basename(os.path.dirname(p))})\n"
-                )
-                for date, t in got:
-                    out.write(f"- [{date}] {t}\n")
-        if a.source in ("auto", "codex"):
-            for sid, got in codex_turns(a.days, a.max_chars).items():
-                stats["codex"]["sessions"] += 1
-                stats["codex"]["turns"] += len(got)
-                out.write(f"\n## codex session {sid[:8]}\n")
-                for date, t in got:
-                    out.write(f"- [{date}] {t}\n")
+        for source, label, got in sessions:
+            kept, local = [], set()
+            for date, t in got:
+                if t in templates:
+                    stats["dropped"]["templates"] += 1
+                elif t in local:  # the same message stored twice inside one session
+                    stats["dropped"]["duplicates"] += 1
+                else:
+                    local.add(t)
+                    kept.append((date, t))
+            if not kept:
+                continue
+            stats[source]["sessions"] += 1
+            stats[source]["turns"] += len(kept)
+            out.write(f"\n## {source} session {label}\n")
+            for date, t in kept:
+                out.write(f"- [{date}] {t}\n")
     print(
         json.dumps(
             {
@@ -767,7 +791,7 @@ def main():
         x = s.add_parser(name)
         x.add_argument("run")
         x.add_argument("--candidate", required=True)
-        x.add_argument("--max-bytes", type=int, default=24000)
+        x.add_argument("--max-bytes", type=int, default=SHRINK_BYTES)
         x.add_argument("--max-line", type=int, default=220)
         if name == "install":
             x.add_argument("--accept-report", action="store_true")
